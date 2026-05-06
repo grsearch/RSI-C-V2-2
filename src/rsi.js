@@ -10,7 +10,7 @@
 //   2. 止损检查独立于 K 线周期，每个 tick 都检查（快速止损）
 //
 // 策略：
-//   BUY : RSI(7) < 35（超卖区）+ totalVol ≥ 15 SOL + buyVol ≥ 1.2×sellVol
+//   BUY : RSI(7) < 30（超卖区）且 24h 跌幅 ≥ 60%（AND 逻辑）+ totalVol ≥ 5 SOL + buyVol ≥ 1.2×sellVol
 //   SELL: RSI 下穿 70 / RSI > 80 / 止盈 / 止损 / 量能萎缩出场
 
 const RSI_PERIOD   = parseInt(process.env.RSI_PERIOD       || '7',  10);
@@ -48,7 +48,7 @@ const TRAILING_STOP_PCT      = parseFloat(process.env.TRAILING_STOP_PCT      || 
 
 // ★ 改动: 24h 跌幅买入触发条件
 //   原理: 现价 vs 24h 最高价, 跌幅 >= DROP_24H_BUY_PCT (默认 60%) 时允许买入
-//   独立于 RSI < 30 触发, 是另一个买入入口 (二选一)
+//   ★ V6: 与 RSI < 30 同时满足才触发 (AND 逻辑, 不再是二选一)
 //   注意: drop 用绝对值, 60 表示"跌了 60%"
 const DROP_24H_BUY_ENABLED = (process.env.DROP_24H_BUY_ENABLED || 'true') === 'true';
 const DROP_24H_BUY_PCT     = parseFloat(process.env.DROP_24H_BUY_PCT || '60');
@@ -64,6 +64,10 @@ const ADD_POSITION_MAX_TIMES = parseInt(process.env.ADD_POSITION_MAX_TIMES || '1
 const EMA_PERIOD = parseInt(process.env.EMA_PERIOD || '99', 10);
 // ★ EMA99 不足时的行为：strict=拒绝买入(推荐), lenient=跳过该过滤(旧行为,有漏洞)
 const EMA_INSUFFICIENT_MODE = (process.env.EMA_INSUFFICIENT_MODE || 'strict').toLowerCase();
+
+// ★ V6: EMA99 价格过滤总开关 — 买入时是否要求"价格 < EMA99"
+//   默认 false (关闭), 即不再用 EMA99 过滤买入
+const EMA_PRICE_FILTER_ENABLED = (process.env.EMA_PRICE_FILTER_ENABLED || 'false') === 'true';
 
 // ★ V6: EMA99 斜率过滤 —— 拒绝在 EMA99 下行趋势中买入（"接飞刀"防护）
 //   原理：RSI 超卖在上升趋势中是健康回调 → 适合买入
@@ -414,11 +418,11 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState) {
   }
 
   // ── BUY / ADD_POSITION ─────────────────────────────────────────
-  // ★ 改动:
-  //   触发条件 (满足任一即可): RSI < 30 (超卖)  或  24h 跌幅 >= 60%
-  //   过滤条件: 价格在 EMA99 下方 + 量能确认 (buyVol >= 1.2 × sellVol)
+  // ★ V6 改动:
+  //   触发条件 (AND 逻辑, 两者都要满足): RSI < 30 (超卖)  且  24h 跌幅 >= 60%
+  //   过滤条件: EMA99 价格过滤 (默认关闭, EMA_PRICE_FILTER_ENABLED) + 量能确认
   //   - 未持仓 → 普通买入 (signal='BUY')
-  //   - 已持仓 + 现价比买入价低 50% + 还没加过仓 → 加仓 (signal='ADD_POSITION')
+  //   - 已持仓 + 现价比买入价低 50% + 还满足买入条件 → 加仓 (signal='ADD_POSITION')
   {
     // ★ V5-9: K线数不足 MIN_CANDLES_FOR_SIGNAL 时不买入（RSI/EMA 都未收敛）
     if (belowConvergence) {
@@ -436,11 +440,15 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState) {
       drop24hPct = (high24h - realtimePrice) / high24h * 100;
     }
 
-    // ── 2. 触发条件 (RSI 超卖  或  24h 跌幅大) ────────
+    // ── 2. 触发条件 (★ AND 逻辑: RSI 超卖 且 24h 跌幅大, 两者都要满足) ──
     const rsiTriggered = rsiRealtime < RSI_BUY;
     const dropTriggered = DROP_24H_BUY_ENABLED && drop24hPct !== null && drop24hPct >= DROP_24H_BUY_PCT;
-    if (!rsiTriggered && !dropTriggered) {
-      // 没有触发条件, 进入默认 HOLD 流程
+
+    // ★ V6: AND 逻辑 — 两个条件都必须为 true
+    //   - 如果 DROP_24H_BUY_ENABLED=false, dropTriggered 恒 false → 永不触发
+    //   - 如果 24h 数据缺失 (drop24hPct===null), dropTriggered=false → 不触发
+    if (!(rsiTriggered && dropTriggered)) {
+      // 没有同时满足两个触发条件, 进入默认 HOLD 流程
     } else {
       // ── 3. 区分: 是普通买入还是加仓 ────────────────
       let buyMode = null; // 'NEW' | 'ADD'
@@ -464,18 +472,20 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState) {
         if (lastCandleTs === lastBuyCandle) {
           // 已在本根K线触发过, 跳过
         } else {
-          // ── 5. EMA99 过滤: 价格必须在 EMA99 下方 ──
+          // ── 5. EMA99 价格过滤 (★ 默认关闭, EMA_PRICE_FILTER_ENABLED=false) ──
           const ema99 = calcEMA(closes, EMA_PERIOD);
-          if (!Number.isFinite(ema99)) {
-            if (EMA_INSUFFICIENT_MODE === 'strict') {
+          if (EMA_PRICE_FILTER_ENABLED) {
+            if (!Number.isFinite(ema99)) {
+              if (EMA_INSUFFICIENT_MODE === 'strict') {
+                updateState();
+                return { rsi: rsiRealtime, prevRsi, signal: null,
+                         reason: `EMA99_INSUFFICIENT_DATA(${closes.length}/${EMA_PERIOD})`, volume: volumeInfo };
+              }
+            } else if (realtimePrice >= ema99) {
               updateState();
               return { rsi: rsiRealtime, prevRsi, signal: null,
-                       reason: `EMA99_INSUFFICIENT_DATA(${closes.length}/${EMA_PERIOD})`, volume: volumeInfo };
+                       reason: `PRICE_ABOVE_EMA99(price=${realtimePrice.toFixed(8)},ema99=${ema99.toFixed(8)})`, volume: volumeInfo };
             }
-          } else if (realtimePrice >= ema99) {
-            updateState();
-            return { rsi: rsiRealtime, prevRsi, signal: null,
-                     reason: `PRICE_ABOVE_EMA99(price=${realtimePrice.toFixed(8)},ema99=${ema99.toFixed(8)})`, volume: volumeInfo };
           }
 
           // ── 6. EMA99 斜率过滤 (默认已关闭) ──
@@ -499,22 +509,23 @@ function evaluateSignal(closedCandles, realtimePrice, tokenState) {
           if (volCheck.pass) {
             tokenState._lastBuyCandle = lastCandleTs;
             updateState();
-            // 构造原因字符串
+            // 构造原因字符串 — AND 逻辑下两个触发条件都一定满足, 全部列出
             const triggers = [];
-            if (rsiTriggered) triggers.push(`RSI_OVERSOLD(${rsiRealtime.toFixed(1)}<${RSI_BUY})`);
-            if (dropTriggered) triggers.push(`DROP24H(${drop24hPct.toFixed(1)}%>=${DROP_24H_BUY_PCT}%)`);
-            const triggerStr = triggers.join('|');
+            triggers.push(`RSI_OVERSOLD(${rsiRealtime.toFixed(1)}<${RSI_BUY})`);
+            triggers.push(`DROP24H(${drop24hPct.toFixed(1)}%>=${DROP_24H_BUY_PCT}%)`);
+            const triggerStr = triggers.join('+');
+            const emaStr = EMA_PRICE_FILTER_ENABLED ? 'EMA99OK' : 'EMA99_OFF';
             const slopeStr = slopeResult
               ? `EMA99_SLOPE=${slopeResult.slopePct.toFixed(3)}%`
               : `EMA99_SLOPE=N/A`;
             if (buyMode === 'NEW') {
               return { rsi: rsiRealtime, prevRsi, signal: 'BUY',
-                       reason: `${triggerStr}+EMA99OK+${slopeStr}+${volCheck.reason}`,
+                       reason: `${triggerStr}+${emaStr}+${slopeStr}+${volCheck.reason}`,
                        volume: volumeInfo };
             } else {
               // 加仓
               return { rsi: rsiRealtime, prevRsi, signal: 'ADD_POSITION',
-                       reason: `ADD_POS+${triggerStr}+EMA99OK+${slopeStr}+${volCheck.reason}`,
+                       reason: `ADD_POS+${triggerStr}+${emaStr}+${slopeStr}+${volCheck.reason}`,
                        volume: volumeInfo };
             }
           }
@@ -660,6 +671,7 @@ module.exports = {
     TAKE_PROFIT_PCT, STOP_LOSS_PCT, KLINE_SEC,
     TRAILING_STOP_ENABLED, TRAILING_STOP_ACTIVATE, TRAILING_STOP_PCT,
     EMA_PERIOD, MIN_CANDLES_FOR_SIGNAL,
+    EMA_PRICE_FILTER_ENABLED,
     EMA_SLOPE_ENABLED, EMA_SLOPE_LOOKBACK, EMA_SLOPE_MIN_PCT,
     // ★ 改动: 24h 跌幅 + 加仓配置
     DROP_24H_BUY_ENABLED, DROP_24H_BUY_PCT,

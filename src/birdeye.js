@@ -527,8 +527,9 @@ async function get24hHigh(address) {
   // 注意: KLINE_TYPE_MAP 必须包含 3600 (1h), 否则会自动映射到最接近的
   const candles = await getOHLCV(address, 3600, 25);
   if (!candles || candles.length === 0) {
-    // 拉取失败 → 缓存 null 5 分钟避免重试风暴
-    _high24hCache.set(address, { high: null, ts: Date.now() - HIGH24H_CACHE_MS + 5 * 60 * 1000 });
+    // 拉取失败 → 短期缓存 null (HIST_FETCH_GAP_MS 级别，让串行队列重试时能真正重新拉取)
+    // 旧逻辑缓存 5 分钟会导致队列退避重试命中缓存直接返回 null
+    _high24hCache.set(address, { high: null, ts: Date.now() - HIGH24H_CACHE_MS + 3000 });
     return null;
   }
   // 取最近 24 小时内最高 high

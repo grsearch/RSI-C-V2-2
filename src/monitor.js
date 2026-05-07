@@ -12,21 +12,8 @@
 
 const EventEmitter = require('events');
 const { evaluateSignal, buildCandles, filterValidCandles, checkStopLoss,
-        calcRSIWithState, stepRSI,
-        calcEMASlope,
         TRAILING_STOP_ENABLED, TRAILING_STOP_ACTIVATE, TRAILING_STOP_PCT } = require('./rsi');
 
-// RSI 卖出阈值（从 CONFIG 取，与 rsi.js 保持一致）
-const { CONFIG: RSI_CONFIG } = require('./rsi');
-const _RSI_SELL  = RSI_CONFIG.RSI_SELL;
-const _RSI_PANIC = RSI_CONFIG.RSI_PANIC;
-
-// ★ EMA99 斜率卖出门槛 — 趋势型退场，独立于买入门槛
-//   斜率 < EMA_SLOPE_SELL_PCT 时立即清仓（不等 RSI 下穿、不等止损）
-//   默认 -2% — 当 EMA99 在 lookback 窗口内累计跌超过 2%，视为趋势恶化
-// ★ 改动: 默认关闭 EMA99 斜率卖出
-const EMA_SLOPE_SELL_ENABLED = (process.env.EMA_SLOPE_SELL_ENABLED || 'false') === 'true';
-const EMA_SLOPE_SELL_PCT     = parseFloat(process.env.EMA_SLOPE_SELL_PCT || '-2');
 const trader    = require('./trader');
 const birdeye   = require('./birdeye');
 const HIST_BARS = parseInt(process.env.HIST_BARS || '150', 10); // 启动时拉取的历史K线根数
@@ -36,32 +23,27 @@ const dataStore = require('./dataStore');
 const heliusWs  = require('./heliusWs');
 const xMentions = require('./xMentions');
 
-const FDV_EXIT          = parseFloat(process.env.FDV_EXIT_USD        || '30000');  // ★ V5: 改为3万
-const LP_EXIT           = parseFloat(process.env.LP_EXIT_USD         || '10000');  // ★ V5: LP<1万退出
+const FDV_EXIT          = parseFloat(process.env.FDV_EXIT_USD        || '30000');
+const LP_EXIT           = parseFloat(process.env.LP_EXIT_USD         || '10000');
 const POLL_SEC          = parseInt(process.env.PRICE_POLL_SEC        || '1',  10);
-const KLINE_SEC         = parseInt(process.env.KLINE_INTERVAL_SEC    || '300', 10);
+// ★ V7: K 线宽度从 5 分钟改为 1 分钟 (量能突破策略需要更细粒度)
+const KLINE_SEC         = parseInt(process.env.KLINE_INTERVAL_SEC    || '60', 10);
 const DRY_RUN           = (process.env.DRY_RUN || 'false') === 'true';
 const TRADE_SOL         = parseFloat(process.env.TRADE_SIZE_SOL      || '2');
-const SELL_COOLDOWN_SEC = parseInt(process.env.SELL_COOLDOWN_SEC     || '1800', 10); // 默认30分钟
-// ★ V5-21: 最大持仓时间 - 防止僵持币长期占用资金
-//   持仓超过 N 秒强制卖出, 0 = 关闭. 默认 7200 = 2 小时
-const MAX_HOLD_SEC      = parseInt(process.env.MAX_HOLD_SEC          || '7200', 10);
-const SL_POLL_SEC       = parseInt(process.env.SL_POLL_SEC           || '60', 10);
-const MAX_TOKENS        = parseInt(process.env.MAX_MONITOR_TOKENS    || '95', 10);  // ★ V5: 最大监控数
-const OVERVIEW_PATROL_SEC = parseInt(process.env.OVERVIEW_PATROL_SEC || '7200', 10); // ★ V5: FDV/LP巡检间隔(秒)
+const SELL_COOLDOWN_SEC = parseInt(process.env.SELL_COOLDOWN_SEC     || '1800', 10);
+// ★ V7: 持仓超时由 rsi.js 的 HOLD_TIMEOUT_SEC 控制 (默认 30 分钟), MAX_HOLD_SEC 已删除
+const SL_POLL_SEC       = parseInt(process.env.SL_POLL_SEC           || '30', 10);
+const MAX_TOKENS        = parseInt(process.env.MAX_MONITOR_TOKENS    || '95', 10);
+const OVERVIEW_PATROL_SEC = parseInt(process.env.OVERVIEW_PATROL_SEC || '7200', 10);
 
 // ★ 历史K线拉取队列：串行执行 + 退避，避免 Birdeye 429
-//   - HIST_FETCH_GAP_MS: 每个请求间隔
-//   - HIST_RETRY_MAX:    429/错误时最大重试次数
-//   - HIST_RETRY_BASE:   退避基准（指数退避：base × 2^n）
 const HIST_FETCH_GAP_MS = parseInt(process.env.HIST_FETCH_GAP_MS || '1200', 10);
 const HIST_RETRY_MAX    = parseInt(process.env.HIST_RETRY_MAX    || '5',   10);
 const HIST_RETRY_BASE_MS = parseInt(process.env.HIST_RETRY_BASE_MS || '5000', 10);
 
-// ★ V5-16: 实时 OHLCV K 线刷新（每 OHLCV_REFRESH_SEC 秒拉一次最新K线，替代不准的 ticks 聚合）
-//   默认开启 (true)。如果出问题想回退旧逻辑，设为 false 即可。
+// ★ V5-16: 实时 OHLCV K 线刷新
 const OHLCV_REALTIME_ENABLED = (process.env.OHLCV_REALTIME_ENABLED || 'true') === 'true';
-// 实时刷新只在主轮询里需要的少量 K 线（够算 RSI 和 EMA99 即可）
+// V7: K 线变 1 分钟, 仍然只需要够算量能基线即可 (默认 120 根 = 2 小时)
 const OHLCV_REALTIME_BARS = parseInt(process.env.OHLCV_REALTIME_BARS || '120', 10);
 
 class HistFetchQueue {
@@ -225,8 +207,7 @@ class TokenMonitor extends EventEmitter {
           if (t.lp != null) state.lp = t.lp;
           if (t.createdAt != null) state.createdAt = t.createdAt;
 
-          // ★ 不恢复 RSI 缓存（_rsiAvgGain 等）— 从 ticks 重新计算
-          //   旧缓存的 lastClose 跟当前价格可能差很远，stepRSI 会算出虚高RSI
+          // V7: 不恢复任何策略级缓存, 量能基线从 ticks/historicalCandles 重新计算
 
           // 恢复持仓状态
           if (t.inPosition && t.position) {
@@ -289,8 +270,7 @@ class TokenMonitor extends EventEmitter {
         position:       s.position,
         tradeCount:     s.tradeCount,
         _sellCooldownUntil: s._sellCooldownUntil,
-        // ★ 不再保存 RSI 缓存状态（_rsiAvgGain 等）
-        //   恢复后由 ticks 重新聚合 K 线重算，避免旧缓存与新 ticks 不匹配导致 RSI 虚高
+        // V7: 仅持久化基本状态, 策略层缓存运行时重建
       }));
       dataStore.saveTokens(list);
     } catch (_) {}
@@ -330,39 +310,23 @@ class TokenMonitor extends EventEmitter {
       meta,
       fdv               : meta.fdv ?? null,
       lp                : meta.lp  ?? null,
-      createdAt         : meta.createdAt ?? null,  // ★ V5: 代币创建时间(ms)
+      createdAt         : meta.createdAt ?? null,
       addedAt           : now,
       ticks             : [],
-      historicalCandles : [],  // ★ 启动时从 Birdeye 拉取的历史K线（用于EMA99/RSI预热）
+      historicalCandles : [],  // 启动时从 Birdeye 拉取的历史K线（用于量能基线预热）
       inPosition        : false,
       position          : null,
-      tradeCount        : 0,       // 完成的买卖轮次数
+      tradeCount        : 0,
       tradeLogs         : [],
       tradeRecords      : [],
-      _prevRsiRealtime  : NaN,
-      _prevRsiTs        : 0,
-      _lastBuyCandle    : -1,
-      _lastSellCandle   : -1,
-      _lastPanicSellTs  : 0,       // RSI_PANIC 时间防抖（毫秒时间戳）
+      _lastBuyCandle    : -1,             // 同根 K 线买入去重
+      _lastSellPressureCandle: -1,        // 同根 K 线卖压触发去重
+      _pendingBuy       : null,            // V7.1 L3 跟根确认状态 { candleTs, signalClose, signalTs, reason }
       _lastPriceUsd     : null,
       _lastPriceTs      : 0,
-      // ★ 实时 RSI 下穿检测缓存（每个 WS tick 更新，不依赖 1s 轮询）
-      _rsiAvgGain       : NaN,     // 最新已收盘K线的 avgGain
-      _rsiAvgLoss       : NaN,     // 最新已收盘K线的 avgLoss
-      _rsiLastClose     : NaN,     // 最新已收盘K线的 close
-      _rsiLastCandleTs  : -1,      // 对应的 K 线 openTime（用于检测 K 线是否刷新）
-      _rsiPrevTickRsi   : NaN,     // 保留字段（暂未使用）
-      _slPollPrevRsi    : NaN,     // 500ms轮询的上一次实时RSI（用于下穿检测）
-      _wsTickPrevRsi    : NaN,     // ★ WS tick的上一次实时RSI（用于下穿检测）
-      _lastRsiCrossSellTs: 0,      // ★ RSI下穿70的时间防抖（毫秒时间戳）
-      // ★ 多次买卖相关
-      _sellCooldownUntil: 0,       // 卖出后冷却到期时间戳
-      _selling          : false,   // 正在执行卖出中（防并发）
-      // ★ 改动: 24h 最高价跟踪 (用于"24h跌幅 >= 60%" 买入触发条件 + dashboard 显示)
-      _high24h          : null,    // 最近 24 小时最高价 (USD)
-      _high24hTs        : 0,       // _high24h 上次刷新时间戳
-      // ★ 改动: 加仓追踪
-      _addPositionsCount: 0,       // 已加仓次数 (最多 1 次)
+      // 多次买卖
+      _sellCooldownUntil: 0,              // 卖出后冷却到期时间戳
+      _selling          : false,          // 正在执行卖出中（防并发）
     };
 
     this._tokens.set(address, state);
@@ -409,25 +373,12 @@ class TokenMonitor extends EventEmitter {
         s2._histMeta = histCandles?._meta || { requestedBars: HIST_BARS, returnedItems: 0, closedBars: 0, error: 'UNKNOWN' };
         if (histCandles && histCandles.length > 0) {
           s2.historicalCandles = histCandles;
-          logger.info('[Monitor] %s 历史K线预热: %d 根 (EMA99/RSI立即可用)',
+          logger.info('[Monitor] %s 历史K线预热: %d 根 (量能基线立即可用)',
             symbol, histCandles.length);
         } else {
           logger.warn('[Monitor] %s 历史K线预热失败: %s', symbol, s2._histMeta.error);
         }
       });
-
-      // ★ 改动: 拉取 24 小时最高价 (用于跌幅判断 + 前端显示)
-      try {
-        const high24 = await birdeye.get24hHigh(address);
-        if (high24 !== null && Number.isFinite(high24) && high24 > 0) {
-          const s3 = this._tokens.get(address);
-          if (s3) {
-            s3._high24h   = high24;
-            s3._high24hTs = Date.now();
-            logger.info('[Monitor] %s 24h最高价: $%s', symbol, high24.toPrecision(6));
-          }
-        }
-      } catch (_) {}
     })();
 
     logger.info("[Monitor] ➕ 开始监控 %s (%s) | DRY_RUN=%s",
@@ -500,14 +451,6 @@ class TokenMonitor extends EventEmitter {
     state._lastPriceUsd = price;
     state._lastPriceTs  = ts;
 
-    // ★ 改动: 实时价格如果创新高,更新 _high24h (避免缓存滞后导致跌幅算不出来)
-    if (Number.isFinite(price) && price > 0) {
-      if (state._high24h === null || price > state._high24h) {
-        state._high24h   = price;
-        state._high24hTs = ts;
-      }
-    }
-
     const tick = { price, ts, source: 'price' };
     state.ticks.push(tick);
 
@@ -527,75 +470,12 @@ class TokenMonitor extends EventEmitter {
         }).finally(() => {
           this._stopLossLocks.delete(address);
         });
-        return; // 已触发卖出，不再检查 RSI
-      }
-
-      // ★★ 实时 RSI 卖出检查（每个 WS tick 都算，不等 K 线收盘）
-      this._checkRealtimeRsiSell(state, price);
-    }
-  }
-
-  /**
-   * ★ V5 修复: 实时 RSI 卖出检查
-   *   - RSI恐慌卖(>80): 只信任已收盘K线RSI，不用stepRSI（避免K线内波动导致虚假高RSI）
-   *   - RSI下穿70: 仍用stepRSI实时检测（下穿检测对精度要求低于绝对值判断）
-   */
-  _checkRealtimeRsiSell(state, price) {
-    const avgGain   = state._rsiAvgGain;
-    const avgLoss   = state._rsiAvgLoss;
-    const lastClose = state._rsiLastClose;
-    if (!Number.isFinite(avgGain) || !Number.isFinite(avgLoss) || !Number.isFinite(lastClose)) return;
-
-    // ★ V5-9: K线数不足时 RSI 不收敛，实时 stepRSI 会乱跳（虚假下穿）
-    //         已收盘K线数 = 历史 + 实时，两者都算进来
-    const histLen = (state.historicalCandles && state.historicalCandles.length) || 0;
-    const liveLen = state._rsiClosedCount || 0;
-    const totalClosed = histLen + liveLen;
-    const MIN_CANDLES_FOR_SIGNAL = RSI_CONFIG.MIN_CANDLES_FOR_SIGNAL;
-    if (totalClosed < MIN_CANDLES_FOR_SIGNAL) return;
-
-    // 用当前实时价格计算实时 RSI
-    const rsiNow = stepRSI(avgGain, avgLoss, lastClose, price);
-    if (!Number.isFinite(rsiNow)) return;
-
-    const prevRsi = state._wsTickPrevRsi;
-    const prevTs  = state._wsTickPrevRsiTs || 0;
-    const now = Date.now();
-
-    // ★ V5-15: prevRsi 时效保护
-    //   Birdeye WS 偶尔断流几十秒，恢复后第一个 tick 如果直接和旧 prevRsi 比较，
-    //   会产生"71.3→32.6"这种虚假大跳（实际是两个不连续采样对比）。
-    //   解决：超过 STALE_MS 视为失效，重建 baseline 但不触发下穿判断。
-    const STALE_MS = parseInt(process.env.WS_RSI_PREV_STALE_MS || '3000', 10);
-    const isStale  = !Number.isFinite(prevRsi) || (now - prevTs) > STALE_MS;
-
-    // 更新上一次的实时 RSI 和时间戳（用于下一次下穿检测）
-    state._wsTickPrevRsi   = rsiNow;
-    state._wsTickPrevRsiTs = now;
-
-    if (isStale) return; // prev 失效（首次 tick 或断流过久），跳过这次下穿判断
-
-    // ── RSI > 80 恐慌卖 — ★ V5 改为只在主轮询的已收盘K线RSI中触发 ──
-    //    stepRSI 在K线内波动剧烈时容易算出虚假高值（如95），
-    //    而已收盘K线RSI更稳定、与交易所显示一致。
-    //    此处不再处理 RSI_PANIC，由 evaluateSignal 和 _stopLossPoll 负责。
-
-    // ── RSI 下穿 70（实时：prevRsi >= 70 且 rsiNow < 70）──
-    //    下穿检测只看方向变化，对绝对值精度要求低，stepRSI可信
-    if (prevRsi >= _RSI_SELL && rsiNow < _RSI_SELL) {
-      const lastCrossTs = state._lastRsiCrossSellTs ?? 0;
-      if (now - lastCrossTs >= 2000) {
-        state._lastRsiCrossSellTs = now;
-        logger.info('[Monitor] ⚡ WS实时RSI下穿卖出 %s @ %.8f | RSI %.1f→%.1f',
-          state.symbol, price, prevRsi, rsiNow);
-        this._doSell(state, `RSI_CROSS_DOWN_70_RT(${prevRsi.toFixed(1)}→${rsiNow.toFixed(1)})`).catch(err => {
-          logger.error('[Monitor] WS RSI下穿卖出失败 %s: %s', state.symbol, err.message);
-        });
+        return; // 已触发卖出，不再检查后续逻辑
       }
     }
   }
 
-  // ★ V5-16: 获取用于 RSI/EMA 计算的 K 线序列
+  // ★ V5-16: 获取用于策略计算的 K 线序列
   //   开关开启时：用 Birdeye OHLCV 实时刷新（精准）+ Helius 量能合并
   //   开关关闭时：用 ticks 实时聚合 + 历史K线（旧逻辑）
   //   返回 { closedCandles, currentCandle, source }
@@ -638,10 +518,10 @@ class TokenMonitor extends EventEmitter {
             c.sellVolume = 0;
           }
         }
-        // ★ V5-17: 把实时价格写回最新一根 K 线 close
-        //   Birdeye OHLCV 数据有 30s 缓存 + 服务端延迟，最新一根 close 滞后于实时价格
-        //   evaluateSignal 用 closedCandles 算 stepRSI 时，lastClose 必须是实时的，否则 RSI 跟不上
-        //   做法: 深拷贝最后一根，把 close 替换为实时价；high/low 也同步更新
+        // 把实时价格写回最新一根 K 线 close
+        //   Birdeye OHLCV 数据有 30s 缓存 + 服务端延迟, 最新一根 close 滞后于实时价格
+        //   V7 量能突破策略用 close vs open 算 1min 涨幅, lastClose 必须是实时的
+        //   做法: 深拷贝最后一根, 把 close 替换为实时价; high/low 也同步更新
         const closedOut = candles.slice();
         if (closedOut.length > 0 && state._lastPriceUsd && state._lastPriceUsd > 0) {
           const last = { ...closedOut[closedOut.length - 1] };
@@ -766,26 +646,7 @@ class TokenMonitor extends EventEmitter {
         state._lastPriceUsd = price;
         state._lastPriceTs = Date.now();
 
-        // ★ V5-21: 最大持仓时间检查 (在所有其他卖出逻辑之前)
-        //   防止僵持币(RSI 一直在 30-70 之间徘徊)长期占用资金
-        if (MAX_HOLD_SEC > 0 && state.position?.buyTime) {
-          const heldSec = Math.round((Date.now() - state.position.buyTime) / 1000);
-          if (heldSec >= MAX_HOLD_SEC) {
-            const heldH = (heldSec / 3600).toFixed(1);
-            const reason = `TIMEOUT_EXIT(${heldH}h>=${(MAX_HOLD_SEC/3600).toFixed(0)}h)`;
-            logger.info('[Monitor] ⏰ 超时卖出 %s @ %.8f | %s | 持仓%ds',
-              state.symbol, price, reason, heldSec);
-            this._stopLossLocks.add(address);
-            this._doSell(state, reason).catch(err => {
-              logger.error('[Monitor] 超时卖出失败 %s: %s', state.symbol, err.message);
-            }).finally(() => {
-              this._stopLossLocks.delete(address);
-            });
-            continue;
-          }
-        }
-
-        // ── 1. 止损/移动止损检查 ──────────────────────────────
+        // ── 1. 移动止损 / 持仓超时 ──────────────────────
         const sl = checkStopLoss(price, state);
         if (sl.shouldExit) {
           const holdSec = state.position?.buyTime ? Math.round((Date.now() - state.position.buyTime) / 1000) : 0;
@@ -800,112 +661,18 @@ class TokenMonitor extends EventEmitter {
           continue;
         }
 
-        // ── 2. RSI 卖出检查（双重方式：已收盘K线 + stepRSI实时估算） ──
-        // ★ V5-16: K 线来源由 _getCurrentCandles 决定（OHLCV 实时刷新 or ticks 聚合）
+        // ── 2. 量能型卖出: 卖压反转 / 量能衰竭 ──────────
+        //    复用 evaluateSignal — 持仓中且非止损会走卖压/衰竭检查
         const { closedCandles } = await this._getCurrentCandles(state);
         if (closedCandles && closedCandles.length > 0) {
-          if (closedCandles.length >= RSI_CONFIG.RSI_PERIOD + 2) {
-            const closes = closedCandles.map(c => c.close);
-            const { rsiArray, avgGain, avgLoss } = calcRSIWithState(closes);
-            const len     = closes.length;
-
-            // ★ 同时缓存 avgGain/avgLoss/lastClose，供 WS tick 实时 RSI 使用
-            const lastCandleTsPoll = closedCandles[len - 1].openTime;
-            if (lastCandleTsPoll !== state._rsiLastCandleTs) {
-              state._rsiAvgGain     = avgGain;
-              state._rsiAvgLoss     = avgLoss;
-              state._rsiLastClose   = closes[len - 1];
-              state._rsiLastCandleTs = lastCandleTsPoll;
-            }
-            // ★ V5-9: 保存当前 closedCandles 数量，供 _checkRealtimeRsiSell 判断是否已收敛
-            state._rsiClosedCount = len;
-
-            // ★ V5-9: K线数不足 MIN_CANDLES_FOR_SIGNAL 时 RSI 未收敛，跳过所有 RSI 卖出逻辑
-            if (len < RSI_CONFIG.MIN_CANDLES_FOR_SIGNAL) {
-              continue; // 进入下一轮轮询
-            }
-
-            // ★ EMA99 斜率卖出 — 趋势型退场（优先级高于 RSI 下穿，低于超时和止损）
-            //   斜率 < EMA_SLOPE_SELL_PCT (默认 -2%) 时立即清仓
-            //   原理：EMA99 在 lookback 窗口内累计跌超 N%，趋势已恶化，不等 RSI 慢半拍
-            if (EMA_SLOPE_SELL_ENABLED && len >= RSI_CONFIG.EMA_PERIOD + RSI_CONFIG.EMA_SLOPE_LOOKBACK) {
-              const slope = calcEMASlope(closes, RSI_CONFIG.EMA_PERIOD, RSI_CONFIG.EMA_SLOPE_LOOKBACK);
-              if (slope && slope.slopePct < EMA_SLOPE_SELL_PCT) {
-                const lastSlopeSellTs = state._lastEmaSlopeSellTs ?? 0;
-                if (Date.now() - lastSlopeSellTs >= 2000) {
-                  state._lastEmaSlopeSellTs = Date.now();
-                  const reason = `EMA99_SLOPE_DOWN_EXIT(slope=${slope.slopePct.toFixed(3)}%<${EMA_SLOPE_SELL_PCT}%,lb=${RSI_CONFIG.EMA_SLOPE_LOOKBACK})`;
-                  logger.info('[Monitor] ⚡ EMA99斜率卖出 %s @ %.8f | %s',
-                    state.symbol, price, reason);
-                  this._doSell(state, reason).catch(err => {
-                    logger.error('[Monitor] EMA99斜率卖出失败 %s: %s', state.symbol, err.message);
-                  });
-                  continue;  // 已触发卖出，跳过本轮 RSI 检查
-                }
-              }
-            }
-
-            // ★ 用 stepRSI 计算实时 RSI（基于当前价格，而非等K线收盘）
-            const rsiRealtime = stepRSI(avgGain, avgLoss, closes[len - 1], price);
-            const rsiClosedLast = rsiArray[len - 1];  // 最新已收盘K线RSI（作为 prev 参考）
-
-            // ★ V5-17: _slPollPrevRsi 加时效保护
-            //   旧逻辑：直接用 state._slPollPrevRsi，没有时间戳。
-            //   如果某轮轮询被卡住或币暂时跳过，再次跑时 prev 是几分钟前的值，
-            //   和当前 rsiRealtime 比较会产生虚假下穿（如 71.0→69.4 实际从未发生）。
-            //   修复：用 _slPollPrevRsiTs 记录时间戳，超过 STALE 视为失效，跳过本次下穿判断。
-            const SL_PREV_STALE_MS = parseInt(process.env.SL_POLL_PREV_STALE_MS || '3000', 10);
-            const slPrevTs = state._slPollPrevRsiTs || 0;
-            const slIsStale = !Number.isFinite(state._slPollPrevRsi) || (Date.now() - slPrevTs) > SL_PREV_STALE_MS;
-            const prevRsiPoll = slIsStale ? NaN : state._slPollPrevRsi;
-            // 始终更新本次的 prev（无论这次是否触发）
-            state._slPollPrevRsi   = rsiRealtime;
-            state._slPollPrevRsiTs = Date.now();
-
-            if (Number.isFinite(rsiRealtime)) {
-              // ★ V5: RSI > 80 恐慌卖 — 改为用已收盘K线RSI判断，不用stepRSI
-              //   stepRSI在K线内波动时容易算出虚假高值
-              if (Number.isFinite(rsiClosedLast) && rsiClosedLast > _RSI_PANIC) {
-                const lastPanicTs = state._lastPanicSellTs ?? 0;
-                if (Date.now() - lastPanicTs >= 2000) {
-                  state._lastPanicSellTs = Date.now();
-                  logger.info('[Monitor] ⚡ RSI恐慌卖出(K线) %s @ %.8f | RSI_K=%.1f>%d',
-                    state.symbol, price, rsiClosedLast, _RSI_PANIC);
-                  this._doSell(state, `RSI_PANIC(K=${rsiClosedLast.toFixed(1)}>${_RSI_PANIC})`).catch(err => {
-                    logger.error('[Monitor] RSI恐慌卖出失败 %s: %s', state.symbol, err.message);
-                  });
-                }
-              }
-              // RSI 下穿70：支持两种 prev 来源
-              //   a) 上次轮询的实时 RSI (prevRsiPoll) — 500ms 间隔的 tick-to-tick 比较
-              //   b) 最新已收盘K线 RSI (rsiClosedLast) — K线级别的下穿
-              else if (Number.isFinite(prevRsiPoll) && prevRsiPoll >= _RSI_SELL && rsiRealtime < _RSI_SELL) {
-                const lastCrossTs = state._lastRsiCrossSellTs ?? 0;
-                if (Date.now() - lastCrossTs >= 2000) {
-                  state._lastRsiCrossSellTs = Date.now();
-                  logger.info('[Monitor] ⚡ RSI下穿卖出(轮询RT) %s @ %.8f | RSI %.1f→%.1f',
-                    state.symbol, price, prevRsiPoll, rsiRealtime);
-                  this._doSell(state, `RSI_CROSS_DOWN_70(RT:${prevRsiPoll.toFixed(1)}→${rsiRealtime.toFixed(1)})`).catch(err => {
-                    logger.error('[Monitor] RSI下穿卖出失败 %s: %s', state.symbol, err.message);
-                  });
-                }
-              }
-              // 备用：已收盘K线级别下穿（保留原逻辑作为兜底）
-              else if (Number.isFinite(rsiClosedLast)) {
-                const rsiPrevClosed = rsiArray[len - 2];
-                if (Number.isFinite(rsiPrevClosed) && rsiPrevClosed >= _RSI_SELL && rsiClosedLast < _RSI_SELL) {
-                  const candleTs = closedCandles[len - 1].openTime;
-                  if (candleTs !== state._lastSellCandle) {
-                    state._lastSellCandle = candleTs;
-                    logger.info('[Monitor] ⚡ RSI下穿卖出(K线) %s @ %.8f | RSI %.1f→%.1f',
-                      state.symbol, price, rsiPrevClosed, rsiClosedLast);
-                    this._doSell(state, `RSI_CROSS_DOWN_70(K:${rsiPrevClosed.toFixed(1)}→${rsiClosedLast.toFixed(1)})`).catch(err => {
-                      logger.error('[Monitor] RSI下穿卖出失败 %s: %s', state.symbol, err.message);
-                    });
-                  }
-                }
-              }
-            }
+          const sigRes = evaluateSignal(closedCandles, price, state);
+          if (sigRes.signal === 'SELL') {
+            logger.info('[Monitor] ⚡ 量能卖出 %s @ %.8f | %s',
+              state.symbol, price, sigRes.reason);
+            this._doSell(state, sigRes.reason).catch(err => {
+              logger.error('[Monitor] 量能卖出失败 %s: %s', state.symbol, err.message);
+            });
+            continue;
           }
         }
       } catch (_) {}
@@ -998,19 +765,17 @@ class TokenMonitor extends EventEmitter {
       else if (idx === -1) state.ticks.length = 0;  // 全部过期
     }
 
-    // 6. 聚合 K 线（V5-16: 优先 Birdeye OHLCV 实时刷新，fallback 到 ticks 聚合）
+    // 6. 聚合 K 线 (V5-16: 优先 Birdeye OHLCV 实时刷新, fallback 到 ticks 聚合)
     const { closedCandles, currentCandle } = await this._getCurrentCandles(state);
 
-    // 7. RSI + 量能信号评估
+    // 7. 量能突破信号评估 (V7)
     const realtimePrice = currentCandle?.close ?? price;
     const sigRes = evaluateSignal(closedCandles, realtimePrice, state);
-    const { rsi, prevRsi, signal, reason, volume } = sigRes;
+    const { signal, reason, volume } = sigRes;
 
-    // ★ V5-14: 决策追踪 —— 记录本次评估的完整上下文，方便排查"RSI到80为什么没卖"
-    //   只存最近一次到 state，广播时附带
+    // 决策追踪 — 记录本次评估的完整上下文, 用于排查"信号为什么没触发"
     {
       const lastCloses = closedCandles.slice(-5).map(c => c.close).filter(Number.isFinite);
-      const ema99 = lastCloses.length >= 2 ? null : null; // 实际 EMA99 在 rsi.js 内部算，这里存数据特征
       const lastClose = closedCandles.length > 0 ? closedCandles[closedCandles.length-1].close : null;
       const lastCandleTs = closedCandles.length > 0 ? closedCandles[closedCandles.length-1].openTime : null;
       state._signalTrace = {
@@ -1019,28 +784,26 @@ class TokenMonitor extends EventEmitter {
         realtimePrice,
         lastClose,
         lastCandleTs,
-        rsi:            Number.isFinite(rsi) ? parseFloat(rsi.toFixed(2)) : null,
-        prevRsi:        Number.isFinite(prevRsi) ? parseFloat(prevRsi.toFixed(2)) : null,
         signal:         signal || null,
         reason:         reason || '',
-        // 关键去重字段：用于诊断"本应触发的信号被同一K线去重挡住"
-        lastBuyCandle:  state._lastBuyCandle  ?? null,
-        lastSellCandle: state._lastSellCandle ?? null,
-        // 冷却/持仓状态
+        // 量能信息
+        volume:         volume || {},
+        // K 线级去重字段
+        lastBuyCandle:  state._lastBuyCandle ?? null,
+        lastSellPressureCandle: state._lastSellPressureCandle ?? null,
+        // 冷却 / 持仓状态
         inPosition:     !!state.inPosition,
         selling:        !!state._selling,
         cooldownSec:    state._sellCooldownUntil > now ? Math.ceil((state._sellCooldownUntil - now) / 1000) : 0,
-        // 最近 5 根 close，方便对比 GMGN 图表
         recentCloses:   lastCloses.map(v => Number(v.toPrecision(6))),
       };
     }
 
     // 8. 记录信号
-    if (reason && reason !== '' && reason !== 'rsi_rebase') {
+    if (reason && reason !== '') {
       dataStore.appendSignal({
         ts: now, address, symbol: state.symbol,
-        price, rsi: Number.isFinite(rsi) ? parseFloat(rsi.toFixed(2)) : null,
-        prevRsi: Number.isFinite(prevRsi) ? parseFloat(prevRsi.toFixed(2)) : null,
+        price, rsi: null, prevRsi: null,  // V7: RSI 已删除, 字段保留 null 兼容旧日志
         signal, reason, volume, inPosition: state.inPosition,
         tradeCount: state.tradeCount,
       });
@@ -1048,8 +811,6 @@ class TokenMonitor extends EventEmitter {
 
     // 9. 广播实时数据
     const histLen = (state.historicalCandles && state.historicalCandles.length) || 0;
-    // ★ V5-17: liveClosed 是 _getCurrentCandles 内部变量, 这里访问不到
-    //   用 closedCandles.length - histLen 反推, 兜底 0
     const liveLen = Math.max(0, closedCandles.length - histLen);
     wsHub.broadcast({
       type:        'tick',
@@ -1059,8 +820,8 @@ class TokenMonitor extends EventEmitter {
       fdv,
       lp:          state.lp,
       createdAt:   state.createdAt,
-      rsi:         Number.isFinite(rsi) ? parseFloat(rsi.toFixed(2)) : null,
-      prevRsi:     Number.isFinite(prevRsi) ? parseFloat(prevRsi.toFixed(2)) : null,
+      rsi:         null,   // V7: RSI 已删除, 字段保留 null 兼容旧 dashboard
+      prevRsi:     null,
       signal,
       reason,
       closedCount: closedCandles.length,
@@ -1082,23 +843,17 @@ class TokenMonitor extends EventEmitter {
       heliusStats: heliusWs.getStats(),
       // ★ 诊断：这个 token 从 Helius 收到/解析成功的链上交易笔数
       chainStats:  heliusWs.getTokenStats(address),
-      // ★ V5-13: 这个 token 的 Birdeye 价格失败状态（None = 正常）
       priceFail:   birdeye.getPriceFailStatus(address),
-      // ★ V5-18: X (Twitter) 24h 提及数（每 2 小时刷新一次, null=未拉取）
       xMentions:   xMentions.getMentions(address),
-      // ★ 改动: 24h 最高价 + 24h 跌幅 (用于前端显示与排序)
-      high24h:     Number.isFinite(state._high24h) ? state._high24h : null,
-      drop24hPct:  (Number.isFinite(state._high24h) && state._high24h > 0 && Number.isFinite(price) && price > 0)
-                     ? parseFloat(((state._high24h - price) / state._high24h * 100).toFixed(2))
-                     : null,
-      // ★ 改动: 加仓信息
-      addPositionsCount: state._addPositionsCount || 0,
-      // ★ V5-14: 决策追踪（最近一次 evaluateSignal 的完整上下文）
+      // V7: 24h 最高价/加仓已删除, 仅返回 null 以兼容旧 dashboard 字段
+      high24h:     null,
+      drop24hPct:  null,
+      addPositionsCount: 0,
       signalTrace: state._signalTrace || null,
     });
 
-    logger.debug('[RSI] %s price=%.6f rsi=%.2f prev=%.2f signal=%s reason=%s trades=%d inPos=%s cool=%ds',
-      state.symbol, price, rsi, prevRsi, signal || 'none', reason,
+    logger.debug('[Signal] %s price=%.6f signal=%s reason=%s trades=%d inPos=%s cool=%ds',
+      state.symbol, price, signal || 'none', reason,
       state.tradeCount, state.inPosition,
       state._sellCooldownUntil > now ? Math.ceil((state._sellCooldownUntil - now) / 1000) : 0);
 
@@ -1109,12 +864,9 @@ class TokenMonitor extends EventEmitter {
       if (freshFdv !== null && Number.isFinite(freshFdv) && freshFdv < FDV_EXIT) {
         logger.warn('[Monitor] %s 买入被拒: FDV=$%d < $%d', state.symbol, Math.round(freshFdv), FDV_EXIT);
       } else {
-        state.fdv = freshFdv ?? state.fdv;  // 更新最新 FDV
+        state.fdv = freshFdv ?? state.fdv;
         await this._doBuy(state, price, reason);
       }
-    } else if (signal === 'ADD_POSITION' && state.inPosition && !state._selling) {
-      // ★ 改动: 加仓信号 → 走 _doAddPosition (复用买入流程, 但合并到现有仓位)
-      await this._doAddPosition(state, price, reason);
     } else if (signal === 'SELL' && state.inPosition && !state._selling) {
       await this._doSell(state, reason);
     }
@@ -1148,16 +900,13 @@ class TokenMonitor extends EventEmitter {
       const simulatedTokens = Math.floor(TRADE_SOL / price * 1e9);
       state.position = {
         entryPriceUsd      : price,
-        firstEntryPriceUsd : price,           // ★ 改动: 记录首次买入价 (加仓阈值基准)
         amountToken        : simulatedTokens,
         solIn              : TRADE_SOL,
         buyTxid            : `DRY_${Date.now()}`,
         buyTime            : Date.now(),
         buyReason          : reason,
-        _peakPrice         : price,           // ★ 移动止损：初始峰值 = 买入价
-        addPositions       : [],              // ★ 改动: 加仓明细
+        _peakPrice         : price,           // 移动止损：初始峰值 = 买入价
       };
-      state._addPositionsCount = 0;            // ★ 改动: 重置加仓计数
       state.tradeCount++;
       this._addTradeLog(state, { type: 'BUY', symbol: state.symbol, price, reason,
         txid: state.position.buyTxid, solIn: TRADE_SOL, dryRun: true, tradeNum });
@@ -1185,18 +934,15 @@ class TokenMonitor extends EventEmitter {
         } catch (_) { /* 查询失败保留信号价 */ }
 
         state.position = {
-          entryPriceUsd      : actualEntryPrice,    // ★ 用实际成交后价格，不用信号触发时价格
-          firstEntryPriceUsd : actualEntryPrice,    // ★ 改动: 记录首次买入价 (加仓阈值基准)
+          entryPriceUsd      : actualEntryPrice,
           signalPriceUsd     : price,               // 保留信号价用于参考
           amountToken        : result.amountOut,
           solIn              : result.solIn,
           buyTxid            : result.txid,
           buyTime            : Date.now(),
           buyReason          : reason,
-          _peakPrice         : actualEntryPrice,    // ★ 移动止损：初始峰值 = 实际成交价
-          addPositions       : [],                  // ★ 改动: 加仓明细
+          _peakPrice         : actualEntryPrice,
         };
-        state._addPositionsCount = 0;                // ★ 改动: 重置加仓计数
         state.tradeCount++;
         this._addTradeLog(state, { type: 'BUY', symbol: state.symbol,
           price: actualEntryPrice, signalPrice: price, reason,
@@ -1211,111 +957,17 @@ class TokenMonitor extends EventEmitter {
     }
   }
 
-  // ── 加仓 (Add Position) ──────────────────────────────────────────
-  // ★ 改动: 加仓只增加仓位数量, 不增加 tradeCount, 不创建新的交易记录
-  //   重新计算加权平均买入价 → 影响后续止盈/止损/移动止损/PnL 计算
-  //   amountToken / solIn 累加 → 卖出时 trader.sell 会卖掉 全部 (含加仓部分)
-  async _doAddPosition(state, price, reason) {
-    if (state._adding) return;          // 防并发
-    if (!state.inPosition || !state.position) return;
-    if ((state._addPositionsCount || 0) >= 1) {
-      logger.warn('[Monitor] %s 已加仓过, 跳过', state.symbol);
-      return;
-    }
-    state._adding = true;
-
-    const oldEntry = state.position.entryPriceUsd;
-    const oldSolIn = state.position.solIn;
-    const oldTokens = state.position.amountToken;
-    logger.info('[Monitor] 🔵 ADD_POSITION %s @ %.8f | %s | 旧entry=%.8f 旧solIn=%.4f',
-      state.symbol, price, reason, oldEntry, oldSolIn);
-
-    if (DRY_RUN) {
-      const simulatedTokens = Math.floor(TRADE_SOL / price * 1e9);
-      const newSolIn  = oldSolIn + TRADE_SOL;
-      const newTokens = oldTokens + simulatedTokens;
-      // 加权平均买入价 = 总成本 / 总数量 (用 SOL 计价更稳, 因为 entry 用 USD)
-      // 这里简化用: newEntry = (oldEntry × oldTokens + price × simulatedTokens) / newTokens
-      const newEntry = (oldEntry * oldTokens + price * simulatedTokens) / newTokens;
-
-      state.position.amountToken        = newTokens;
-      state.position.solIn              = newSolIn;
-      state.position.entryPriceUsd      = newEntry;
-      state.position._peakPrice         = Math.max(state.position._peakPrice || 0, price); // 不降低峰值
-      state.position.addPositions = state.position.addPositions || [];
-      state.position.addPositions.push({
-        ts: Date.now(), price, solIn: TRADE_SOL,
-        amountToken: simulatedTokens, reason, dryRun: true,
-      });
-      state._addPositionsCount = (state._addPositionsCount || 0) + 1;
-
-      this._addTradeLog(state, { type: 'ADD_POSITION', symbol: state.symbol,
-        price, reason, txid: `DRY_${Date.now()}`,
-        solIn: TRADE_SOL, dryRun: true,
-        newEntry, newSolIn, newTokens, addCount: state._addPositionsCount });
-      logger.info('[Monitor] ✅ DRY_RUN ADD %s @ %.8f  新entry=%.8f 新solIn=%.4f 新tokens=%d',
-        state.symbol, price, newEntry, newSolIn, newTokens);
-    } else {
-      try {
-        const result = await trader.buy(state.address, state.symbol);
-        let actualPrice = price;
-        try {
-          await new Promise(r => setTimeout(r, 500));
-          const postFill = await birdeye.getPrice(state.address);
-          if (postFill && postFill > 0) actualPrice = postFill;
-        } catch (_) {}
-
-        const newSolIn  = oldSolIn + result.solIn;
-        const newTokens = oldTokens + result.amountOut;
-        const newEntry  = (oldEntry * oldTokens + actualPrice * result.amountOut) / newTokens;
-
-        state.position.amountToken   = newTokens;
-        state.position.solIn         = newSolIn;
-        state.position.entryPriceUsd = newEntry;
-        state.position._peakPrice    = Math.max(state.position._peakPrice || 0, actualPrice);
-        state.position.addPositions  = state.position.addPositions || [];
-        state.position.addPositions.push({
-          ts: Date.now(), price: actualPrice, solIn: result.solIn,
-          amountToken: result.amountOut, reason, txid: result.txid,
-        });
-        state._addPositionsCount = (state._addPositionsCount || 0) + 1;
-
-        this._addTradeLog(state, { type: 'ADD_POSITION', symbol: state.symbol,
-          price: actualPrice, reason, txid: result.txid,
-          solIn: result.solIn,
-          newEntry, newSolIn, newTokens, addCount: state._addPositionsCount });
-        logger.info('[Monitor] ✅ ADD %s @ %.8f  新entry=%.8f 新solIn=%.4f 新tokens=%d  txid=%s',
-          state.symbol, actualPrice, newEntry, newSolIn, newTokens, result.txid);
-      } catch (err) {
-        logger.error('[Monitor] ❌ ADD_POSITION %s 失败: %s', state.symbol, err.message);
-      }
-    }
-
-    // ★ 同步更新最近一条 tradeRecord 的 entryPrice/solIn (前端能看到加仓后变化)
-    if (state.tradeRecords && state.tradeRecords.length > 0) {
-      const rec = state.tradeRecords[state.tradeRecords.length - 1];
-      if (rec && rec.exitAt == null) {
-        rec.entryPrice = state.position.entryPriceUsd;
-        rec.solIn      = state.position.solIn;
-        rec.addPositionsCount = state._addPositionsCount;
-        try { dataStore.updateTrade(rec.id, {
-          entryPrice: rec.entryPrice, solIn: rec.solIn,
-          addPositionsCount: rec.addPositionsCount });
-        } catch (_) {}
-        wsHub.broadcast({ type: 'trade_record', ...rec });
-      }
-    }
-
-    state._adding = false;
-  }
-
   // ── 卖出（不再退出监控，重置状态等待下一轮） ────────────────────
 
   async _doSell(state, reason) {
     if (state._selling) return;  // 防并发
     state._selling = true;
 
-    const isStopLoss = reason.includes('STOP_LOSS') || reason.includes('TAKE_PROFIT');
+    // V7: 标记是否为风险型卖出 (用于 trader.sell 是否走快速通道)
+    const isStopLoss = reason.includes('TRAILING_STOP')
+                    || reason.includes('SELL_PRESSURE')
+                    || reason.includes('VOL_FADE')
+                    || reason.includes('HOLD_TIMEOUT');
     const tradeNum = state.tradeCount;
     logger.info('[Monitor] 🔴 SELL #%d %s | %s | isStopLoss=%s | DRY_RUN=%s',
       tradeNum, state.symbol, reason, isStopLoss, DRY_RUN);
@@ -1374,16 +1026,12 @@ class TokenMonitor extends EventEmitter {
     state._selling = false;
     state.position = null;
 
-    // ★ 设置冷却期
+    // 设置冷却期
     state._sellCooldownUntil = Date.now() + SELL_COOLDOWN_SEC * 1000;
-    // 重置 RSI 穿越防抖（允许新的穿越信号）
+    // 重置 K 线级去重 (允许下一轮新信号)
     state._lastBuyCandle  = -1;
-    state._lastSellCandle = -1;
-    state._lastPanicSellTs = 0;
-    state._lastRsiCrossSellTs = 0;  // ★ 重置实时RSI下穿防抖
-    state._wsTickPrevRsi  = NaN;    // ★ 重置WS tick RSI历史
-    state._slPollPrevRsi  = NaN;    // ★ 重置轮询RSI历史
-    state._addPositionsCount = 0;   // ★ 改动: 重置加仓计数 (允许下一轮重新加仓)
+    state._lastSellPressureCandle = -1;
+    state._pendingBuy     = null;  // V7.1: 清除 L3 跟根确认的 pending 状态
 
     logger.info('[Monitor] 🔄 %s 第%d笔完成 | 冷却=%ds',
       state.symbol, tradeNum, SELL_COOLDOWN_SEC);
@@ -1483,10 +1131,6 @@ class TokenMonitor extends EventEmitter {
 
   _stateSnapshot(state) {
     const now = Date.now();
-    const price = state._lastPriceUsd;
-    const drop24hPct = (Number.isFinite(state._high24h) && state._high24h > 0 && Number.isFinite(price) && price > 0)
-      ? parseFloat(((state._high24h - price) / state._high24h * 100).toFixed(2))
-      : null;
     return {
       address:      state.address,
       symbol:       state.symbol,
@@ -1502,10 +1146,10 @@ class TokenMonitor extends EventEmitter {
       lastPriceTs:  state._lastPriceTs,
       fdv:          state.fdv,
       lp:           state.lp,
-      // ★ 改动: 暴露 24h 跌幅 + 加仓信息
-      high24h:      Number.isFinite(state._high24h) ? state._high24h : null,
-      drop24hPct,
-      addPositionsCount: state._addPositionsCount || 0,
+      // V7: 旧字段保留 null 以兼容旧 dashboard
+      high24h:      null,
+      drop24hPct:   null,
+      addPositionsCount: 0,
     };
   }
 
@@ -1575,15 +1219,6 @@ class TokenMonitor extends EventEmitter {
           state.fdv ? Math.round(state.fdv) : '?',
           state.lp ? Math.round(state.lp) : '?',
           state.createdAt ? Math.round((Date.now() - state.createdAt) / 3600000) + 'h' : '?');
-
-        // ★ 改动: 刷新 24h 最高价 (用于跌幅判断 + 前端显示)
-        try {
-          const high24 = await birdeye.get24hHigh(address);
-          if (high24 !== null && Number.isFinite(high24) && high24 > 0) {
-            state._high24h   = high24;
-            state._high24hTs = Date.now();
-          }
-        } catch (_) {}
       } catch (err) {
         logger.warn('[Patrol] %s 巡检失败: %s', state.symbol, err.message);
       }

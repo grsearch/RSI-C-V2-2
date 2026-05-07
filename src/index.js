@@ -52,147 +52,36 @@ app.get('/api/birdeye-status', (_req, res) => {
   });
 });
 
-// ── 回测 API ──────────────────────────────────────────────────────
-const { runBacktest: btRun, gridSearchFromTicks } = require('./backtest');
-
-app.post('/api/backtest/run', (req, res) => {
-  try {
-    const raw = req.body || {};
-    // 显式映射前端字段名 → runBacktest 参数名，确保所有参数正确传入
-    const params = {
-      klineSec:             parseInt(raw.klineSec        || 300),
-      rsiPeriod:            parseInt(raw.rsiPeriod       || 9),
-      rsiBuy:               parseFloat(raw.rsiBuy        || 35),
-      rsiSell:              parseFloat(raw.rsiSell       || 70),
-      rsiPanic:             parseFloat(raw.rsiPanic      || 80),
-      volEnabled:           raw.volEnabled !== false,
-      volBuyMult:           parseFloat(raw.volBuyMult    || 1.2),
-      volSellMult:          parseFloat(raw.volSellMult   || 9999),
-      volMinTotal:          parseFloat(raw.volMinTotal   || 5),
-      volWindowSec:         parseInt(raw.volWindowSec    || 300),
-      volExitConsecutive:   parseInt(raw.volExitConsecutive || 3),
-      volExitRatio:         parseFloat(raw.volExitRatio  || 0.3),
-      volExitLookback:      parseInt(raw.volExitLookback || 4),
-      skipFirstCandles:     parseInt(raw.skipFirstCandles || 8),
-      takeProfitPct:        parseFloat(raw.takeProfitPct || 99999),
-      stopLossPct:          parseFloat(raw.stopLossPct   || -20),
-      trailingStopEnabled:  raw.trailingStopEnabled !== false,
-      trailingStopActivate: parseFloat(raw.trailingStopActivate || 30),
-      trailingStopPct:      parseFloat(raw.trailingStopPct      || -20),
-      tradeSizeSol:         parseFloat(raw.tradeSizeSol  || 0.2),
-      maxTrades:            parseInt(raw.maxTrades       || 99999),
-      sellCooldownSec:      parseInt(raw.sellCooldownSec || 1800),
-      emaPeriod:            parseInt(raw.emaPeriod       || 99),
-      emaEnabled:           raw.emaEnabled !== false,
-    };
-    // 若前端关闭EMA，将 emaPeriod 设为极大值使其永远不满足条件
-    if (!params.emaEnabled) params.emaPeriod = 999999;
-
-    const files = dataStore.listTickFiles();
-    if (files.length === 0) {
-      return res.json({ error: '无 tick 数据', results: [], summary: null });
-    }
-
-    const results = [];
-    for (const f of files) {
-      try {
-        const ticks = dataStore.loadTicks(f.address);
-        if (!ticks || ticks.length < 10) continue;
-        const result = btRun(ticks, params);
-        if (result && result.trades.length > 0) {
-          results.push({ address: f.address, ...result });
-        }
-      } catch (_) {}
-    }
-
-    // 汇总
-    const allTrades = results.flatMap(r => r.trades);
-    const wins   = allTrades.filter(t => t.pnlSol > 0);
-    const losses = allTrades.filter(t => t.pnlSol < 0);
-    const totalPnlSol = allTrades.reduce((s, t) => s + t.pnlSol, 0);
-    const avgPnl = allTrades.length > 0 ? allTrades.reduce((s, t) => s + t.pnlPct, 0) / allTrades.length : 0;
-
-    const summary = {
-      totalTokens:  files.length,
-      tokensTraded: results.length,
-      totalTrades:  allTrades.length,
-      wins:         wins.length,
-      losses:       losses.length,
-      winRate:      allTrades.length > 0 ? (wins.length / (wins.length + losses.length) * 100) : 0,
-      totalPnlSol:  parseFloat(totalPnlSol.toFixed(4)),
-      avgPnlPct:    parseFloat(avgPnl.toFixed(2)),
-      avgWinPct:    wins.length > 0 ? parseFloat((wins.reduce((s, t) => s + t.pnlPct, 0) / wins.length).toFixed(2)) : 0,
-      avgLossPct:   losses.length > 0 ? parseFloat((losses.reduce((s, t) => s + t.pnlPct, 0) / losses.length).toFixed(2)) : 0,
-    };
-
-    res.json({ results, summary, params });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/backtest/grid', (req, res) => {
-  try {
-    const files = dataStore.listTickFiles();
-    if (files.length === 0) {
-      return res.json({ error: '无 tick 数据', results: [] });
-    }
-
-    // 加载所有 tick 数据
-    const allTicks = [];
-    for (const f of files) {
-      try {
-        const ticks = dataStore.loadTicks(f.address);
-        if (ticks && ticks.length >= 10) {
-          allTicks.push({ address: f.address, ticks });
-        }
-      } catch (_) {}
-    }
-
-    if (allTicks.length === 0) {
-      return res.json({ error: '无有效 tick 数据', results: [] });
-    }
-
-    const results = gridSearchFromTicks(allTicks);
-    if (!results || results.length === 0) {
-      return res.json({ error: '网格搜索无结果', results: [] });
-    }
-
-    // 返回 top 20 结果
-    res.json({ results: results.slice(0, 20), total: results.length });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // ── 服务器 ────────────────────────────────────────────────────────
 const server = http.createServer(app);
 wsHub.init(server);
 
 server.listen(PORT, () => {
-  logger.info('🚀 SOL RSI+量能 Monitor V4 启动，端口 %d', PORT);
+  logger.info('🚀 SOL 量能突破 Monitor V7.1 (防陷阱) 启动，端口 %d', PORT);
   logger.info('   模式: %s', DRY_RUN ? '🔵 空跑(DRY_RUN)' : '🔴 实盘(LIVE)');
-  logger.info('   K线=%ds  轮询=%ds  RSI周期=%s  买≤%s  卖≥%s  恐慌>%s',
+  logger.info('   K线=%ss  轮询=%ss  止损轮询=%ss',
     process.env.KLINE_INTERVAL_SEC || 60,
     process.env.PRICE_POLL_SEC     || 1,
-    process.env.RSI_PERIOD         || 9,
-    process.env.RSI_BUY_LEVEL      || 30,
-    process.env.RSI_SELL_LEVEL     || 70,
-    process.env.RSI_PANIC_LEVEL    || 80);
-  logger.info('   量能: enabled=%s window=%ss',
-    process.env.VOL_ENABLED        || 'true',
-    process.env.VOL_WINDOW_SEC     || '120');
-  logger.info('   止盈=%s%%  止损=%s%%  跳过前%s根K线  止损轮询=%ss',
-    process.env.TAKE_PROFIT_PCT    || '50',
-    process.env.STOP_LOSS_PCT      || '-10',
-    process.env.SKIP_FIRST_CANDLES || '8',
-    process.env.SL_POLL_SEC        || '60');
+    process.env.SL_POLL_SEC        || 30);
+  logger.info('   买入条件 (AND): 量能爆发 ≥%sx | 买盘占比 ≥%s%% | 1min涨幅 ≥%s%% | 最低成交量 ≥%s SOL',
+    process.env.VOL_SPIKE_MULT      || 5,
+    process.env.BUY_DOMINANCE_PCT   || 65,
+    process.env.PRICE_MOMENTUM_PCT  || 5,
+    process.env.VOL_MIN_TOTAL       || 5);
+  logger.info('   防陷阱过滤: L1实体/全长≥%s | L2上影/实体≤%s | L3跟根=%s | L4累涨≤%s%% | L5紧止损=%s%%/%ss',
+    process.env.MIN_BODY_RATIO           || 0.5,
+    process.env.MAX_UPPER_WICK_RATIO     || 1.0,
+    (process.env.L3_FOLLOWUP_CONFIRM_ENABLED || 'true') === 'true' ? '开' : '关',
+    process.env.MAX_PRECEDING_RUNUP_PCT  || 30,
+    process.env.FAST_STOP_PCT            || -5,
+    process.env.FAST_STOP_WINDOW_SEC     || 90);
+  logger.info('   卖出条件: 移动止损 峰值-%s%% | 卖压反转 ≥%s%% | 量能衰竭 连续%s根 | 持仓超时 %ss',
+    -1 * parseFloat(process.env.TRAILING_STOP_PCT || '-20'),
+    process.env.SELL_DOMINANCE_PCT  || 60,
+    process.env.VOL_FADE_CONSECUTIVE || 3,
+    process.env.HOLD_TIMEOUT_SEC    || 1800);
   logger.info('   卖出冷却=%ss',
-    process.env.SELL_COOLDOWN_SEC     || '30');
-  logger.info('   EMA99斜率过滤: enabled=%s lookback=%s min=%s%%',
-    process.env.EMA_SLOPE_ENABLED     || 'true',
-    process.env.EMA_SLOPE_LOOKBACK    || '5',
-    process.env.EMA_SLOPE_MIN_PCT     || '0');
+    process.env.SELL_COOLDOWN_SEC || '1800');
 
   // 连接信息
   const birdeyeKey = process.env.BIRDEYE_API_KEY || '';
@@ -237,9 +126,9 @@ server.listen(PORT, () => {
   }
 
   logger.info('');
-  logger.info('   ⚡ 止损路径: BirdeyeWS(1s价格) → 本地判断 → 立即卖出（目标<500ms）');
-  logger.info('   📊 RSI路径:  BirdeyeWS + 轮询兜底 → K线聚合 → RSI信号');
-  logger.info('   📈 量能路径: HeliusWS(链上交易) → buyVol/sellVol → 买入确认');
+  logger.info('   ⚡ 止损路径:  BirdeyeWS(1s价格) → 本地判断 → 立即卖出 (目标<500ms)');
+  logger.info('   📊 信号路径:  Birdeye OHLCV → 1分钟K线 → 量能突破信号引擎');
+  logger.info('   📈 量能路径:  HeliusWS(链上交易) → buyVol/sellVol → 买卖方向判断');
   logger.info('');
 
   monitor.start();
